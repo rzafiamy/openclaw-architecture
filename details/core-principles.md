@@ -4,39 +4,245 @@
 
 OpenClaw's Agent-to-Agent (A2A) architecture is designed to handle complex, multi-step tasks by delegating them to specialized subagents. This approach ensures that the main agent remains responsive and focused, while background tasks are handled in an isolated environment.
 
-The architecture is built on four fundamental pillars:
+---
 
-![Core Principles Illustration](/home/cook/.gemini/antigravity/brain/2993797b-a122-4145-846f-7990305b1801/core_principles_nano_banana_1769764265285.png)
+## Quick Summary
 
-## 1. Strict Isolation
-Each subagent operates within its own dedicated session, which provides:
-- **Clean History**: Subagents do not inherit the parent's conversation history unless explicitly passed. This prevents context pollution and keeps the subagent's attention on the specific task.
-- **Unique workspace**: Subagents can be configured to work in separate directories, ensuring that their file operations do not interfere with the parent or other subagents.
-- **Session Keying**: Sessions are uniquely identified using the format `agent:<AgentId>:subagent:<UUID>`, making them easily trackable and manageable.
-
-## 2. Event-Driven Feedback
-The parent agent is kept informed of the subagent's progress through a background registration system:
-- **Lifecycle Events**: The system monitors `start`, `end`, and `error` events for every spawned subagent.
-- **Real-time Monitoring**: The `SubagentRegistry` tracks every active run, allowing the system to react as soon as a subagent completes or fails.
-- **Non-blocking**: The parent agent can continue interacting with the user or perform other tasks while subagents are running in the background.
-
-## 3. Seamless Re-integration
-Results from subagents are delivered back to the parent agent in a way that feels natural:
-- **Message Steering**: If the parent agent is currently active, results can be "steered" directly into its context window. This allows the parent to receive information as if it just thought of it or as an immediate update from a collaborator.
-- **Follow-up Messages**: If the parent agent is idle, the system can send a follow-up message that triggers a new run, summarizing the subagent's findings.
-- **Natural Language Summaries**: The system automatically generates a concise summary of the subagent's output, allowing the parent agent to quickly understand and use the information.
-
-## 4. Hierarchical Agent Identity
-The system supports a variety of specialized agents, each with its own identity and capabilities:
-- **Unique IDs**: Agents like `main`, `researcher`, and `coder` have distinct profiles.
-- **Specialized Tools**: Different agents can be granted access to different sets of tools (e.g., a `coder` might have a full filesystem and execution tools, while a `researcher` might only have web search and fetch tools).
-- **Model Flexibility**: Each agent can be configured to use different LLMs, choosing the best model for the task (e.g., a faster model for simple research and a more powerful model for complex coding).
+| Principle | What It Means | Why It Matters |
+|:----------|:--------------|:---------------|
+| **Strict Isolation** | Each subagent runs in its own session | Prevents context pollution between tasks |
+| **Event-Driven Feedback** | Parent is notified via lifecycle events | Non-blocking, real-time monitoring |
+| **Seamless Re-integration** | Results injected naturally into parent context | Smooth user experience |
+| **Hierarchical Identity** | Agents have distinct profiles and capabilities | Right tool for the right job |
 
 ---
 
-### Design Rationale: Why this approach?
+## The Four Pillars
+
+The architecture is built on four fundamental pillars that work together to enable reliable task delegation:
+
+```mermaid
+graph TB
+    subgraph "OpenClaw A2A Foundation"
+        direction TB
+        
+        ISO[🔒 Strict Isolation]
+        EVT[📡 Event-Driven Feedback]
+        INT[🔄 Seamless Re-integration]
+        HIE[👤 Hierarchical Identity]
+        
+        ISO --> |"Enables safe"| EVT
+        EVT --> |"Triggers"| INT
+        HIE --> |"Configures"| ISO
+        INT --> |"Returns to"| HIE
+    end
+    
+    style ISO fill:#e1f5fe
+    style EVT fill:#fff3e0
+    style INT fill:#e8f5e9
+    style HIE fill:#fce4ec
+```
+
+---
+
+## 1. Strict Isolation
+
+Each subagent operates within its own dedicated session, which provides complete separation from the parent and other subagents.
+
+### What Gets Isolated
+
+| Aspect | Isolation Method | Benefit |
+|:-------|:-----------------|:--------|
+| **History** | Subagents don't inherit parent's conversation | Prevents context pollution |
+| **Workspace** | Separate directories per agent | No file operation conflicts |
+| **Session Key** | Unique format: `agent:<id>:subagent:<uuid>` | Easy tracking and management |
+| **Memory** | Independent memory/context window | Focused attention on task |
+
+### Example: Session Key Structure
+
+```
+Parent Session:    agent:main:telegram-123
+                        ↓
+                  spawns subagent
+                        ↓
+Child Session:     agent:coder:subagent:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                   └─agent─┘ └─type──┘ └────────────UUID────────────────┘
+```
+
+> **Key Point**: Subagents start with a clean slate. They only know what the parent explicitly tells them in the `task` parameter.
+
+---
+
+## 2. Event-Driven Feedback
+
+The parent agent is kept informed of the subagent's progress through a background registration system that operates without blocking.
+
+### Event Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Parent Agent
+    participant R as SubagentRegistry
+    participant S as Subagent
+    participant E as Event System
+    
+    P->>R: Register run (runId)
+    R->>R: Start monitoring
+    
+    Note over S: Subagent executes task
+    
+    S->>E: emit(lifecycle:start)
+    E-->>R: Event notification
+    R->>R: Update startedAt
+    
+    S->>E: emit(tool:result)
+    S->>E: emit(assistant:text)
+    
+    S->>E: emit(lifecycle:end)
+    E-->>R: Event notification
+    R->>R: Update outcome
+    R->>P: Trigger announce flow
+```
+
+### Lifecycle Events
+
+| Event | When Fired | Contains |
+|:------|:-----------|:---------|
+| `lifecycle:start` | Subagent begins execution | `runId`, `startedAt`, `sessionKey` |
+| `lifecycle:end` | Task completed successfully | `runId`, `endedAt`, `outcome: "ok"` |
+| `lifecycle:error` | Task failed | `runId`, `endedAt`, `outcome: "error"`, `errorMessage` |
+
+> **Key Point**: The parent can continue interacting with the user while monitoring happens automatically in the background.
+
+---
+
+## 3. Seamless Re-integration
+
+Results from subagents are delivered back to the parent agent in a way that feels natural to the conversation flow.
+
+### Delivery Methods
+
+| Method | When Used | How It Works |
+|:-------|:----------|:-------------|
+| **Steering** | Parent is currently active | Inject directly into parent's context window |
+| **Follow-up** | Parent is idle | Send as new message, triggering parent run |
+| **Collect** | Multiple subagents finishing | Batch into single summary message |
+
+### The Announce Flow
+
+```mermaid
+graph LR
+    A[Subagent Completes] --> B{Is Parent Active?}
+    B -->|Yes| C[Steer: Inject into context]
+    B -->|No| D[Follow-up: Queue message]
+    
+    C --> E[Parent processes inline]
+    D --> F[Parent starts new run]
+    
+    E --> G[Natural summary to user]
+    F --> G
+```
+
+### What Gets Delivered
+
+The parent receives a structured trigger message containing:
+
+1. **Status**: Which task finished and whether it succeeded
+2. **Findings**: The subagent's final output/response
+3. **Stats**: Runtime duration, token usage, estimated cost
+4. **Instructions**: How to summarize for the user
+
+> **Key Point**: The system generates a natural language summary automatically - users don't see raw technical details.
+
+---
+
+## 4. Hierarchical Agent Identity
+
+The system supports specialized agents, each with its own identity, tools, and capabilities.
+
+### Agent Specialization Example
+
+| Agent ID | Specialty | Typical Tools | Model Choice |
+|:---------|:----------|:--------------|:-------------|
+| `main` | User interaction | All tools | Balanced model |
+| `researcher` | Information gathering | `web_search`, `web_fetch` | Fast model |
+| `coder` | Code development | `read`, `write`, `exec` | Powerful model |
+
+### Identity Configuration
+
+```yaml
+agents:
+  list:
+    - id: main
+      name: "Primary Assistant"
+      default: true
+      model: anthropic/claude-sonnet
+      
+    - id: researcher
+      name: "Research Specialist"
+      tools:
+        allow: ["group:web"]
+      subagents:
+        allowAgents: ["*"]  # Can spawn any agent
+```
+
+### Spawning Permissions
+
+```mermaid
+graph TD
+    A[Main Agent] -->|"Can spawn"| B[Researcher]
+    A -->|"Can spawn"| C[Coder]
+    A -->|"Can spawn"| D[Writer]
+    
+    B -.->|"❌ Cannot spawn"| X[Any Agent]
+    C -.->|"❌ Cannot spawn"| X
+    D -.->|"❌ Cannot spawn"| X
+    
+    style X fill:#ffcdd2
+```
+
+> **Key Point**: Only the main (parent) agent can spawn subagents. Subagents cannot spawn other subagents, preventing infinite recursion.
+
+---
+
+## Design Rationale: Why This Approach?
+
 By breaking down complex tasks into smaller, isolated sub-tasks, OpenClaw achieves:
-- **Reduced Hallucination**: Specialized agents with limited context are less likely to get confused by irrelevant information.
-- **Scalability**: Multiple subagents can run in parallel, significantly speeding up complex workflows.
-- **Maintainability**: Clear boundaries between agents make it easier to debug and improve specific parts of the system.
-- **User Experience**: The user sees a more organized and responsive system that provides clear updates on background progress.
+
+| Benefit | How It's Achieved |
+|:--------|:------------------|
+| **Reduced Hallucination** | Specialized agents with limited context focus on specific tasks |
+| **Scalability** | Multiple subagents run in parallel, speeding up workflows |
+| **Maintainability** | Clear boundaries make debugging and improvements easier |
+| **User Experience** | Organized, responsive system with clear progress updates |
+
+---
+
+## How It All Connects
+
+```mermaid
+graph TB
+    subgraph "User Interaction"
+        U[User] <-->|"Converses with"| M[Main Agent]
+    end
+    
+    subgraph "Task Delegation"
+        M -->|"1. Spawns with task"| S1[Subagent A]
+        M -->|"1. Spawns with task"| S2[Subagent B]
+    end
+    
+    subgraph "Isolation Layer"
+        S1 -->|"Works in"| ISO1[Session A]
+        S2 -->|"Works in"| ISO2[Session B]
+    end
+    
+    subgraph "Feedback Loop"
+        ISO1 -->|"2. Events"| R[Registry]
+        ISO2 -->|"2. Events"| R
+        R -->|"3. Results"| M
+    end
+    
+    M -->|"4. Summarizes"| U
+```
+
+**Summary**: The parent agent remains the "conductor," maintaining the relationship with the user, while specialized subagents handle heavy lifting in the background without polluting the main context window.

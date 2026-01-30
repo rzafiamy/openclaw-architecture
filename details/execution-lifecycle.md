@@ -4,60 +4,266 @@
 
 The execution lifecycle of a subagent in OpenClaw is a highly orchestrated process that ensures tasks are carried out reliably, results are reported accurately, and resources are managed efficiently. This document walks through each phase of this lifecycle.
 
+---
+
+## Lifecycle Overview
+
 ```mermaid
 stateDiagram-v2
     [*] --> Spawning: Parent calls sessions_spawn
-    Spawning --> Registration: Gateway accepts Run
-    Registration --> ActiveExecution: Listening for events
-    ActiveExecution --> Completion: Task finished or Error
-    Completion --> ResultDelivery: Announce Flow triggered
+    Spawning --> Registration: Gateway accepts run
+    Registration --> ActiveExecution: Event monitoring active
+    ActiveExecution --> Completion: Task finished or error
+    Completion --> ResultDelivery: Announce flow triggered
     ResultDelivery --> Cleanup: Cleanup policy applied
     Cleanup --> [*]
 ```
 
+---
+
+## Phase Summary
+
+| Phase | Duration | Key Actions | State Changes |
+|:------|:---------|:------------|:--------------|
+| **Spawning** | ~100ms | Key generation, prompt prep, dispatch | `runId` created |
+| **Registration** | ~50ms | Registry entry, event listening | `SubagentRunRecord` saved |
+| **Active Execution** | Variable | Task work, tool usage | Events emitted |
+| **Completion** | ~100ms | Status capture, result retrieval | `outcome` set |
+| **Result Delivery** | ~200ms | Message construction, steering/followup | Parent notified |
+| **Cleanup** | Delayed | Archive or delete session | Resources freed |
+
+---
+
 ## Phase 1: Spawning (The Creation)
 
 Everything begins when a parent agent calls the `sessions_spawn` tool.
--   **Identity Resolution**: The system determines which agent profile and model to use.
--   **Session Initialization**: A unique session key is created (`agent:<id>:subagent:<uuid>`).
--   **System Prompt Prep**: A specialized subagent system prompt is injected into the session metadata.
--   **Gateway Dispatch**: The task is sent to the Gateway via the `agent` method in the `subagent` lane.
+
+```mermaid
+sequenceDiagram
+    participant P as Parent Agent
+    participant T as Spawn Tool
+    participant C as Config System
+    participant G as Gateway
+    
+    P->>T: sessions_spawn(task, agentId, ...)
+    T->>T: Validate recursion guard
+    T->>C: Resolve agent config
+    C-->>T: Agent profile, model, tools
+    T->>T: Generate session key
+    T->>T: Build subagent prompt
+    T->>G: callGateway("agent", lane="subagent")
+    G-->>T: {runId, status: "accepted"}
+    T-->>P: Return response
+```
+
+### Key Actions
+
+| Action | Details |
+|:-------|:--------|
+| **Identity Resolution** | Determine which agent profile and model to use |
+| **Session Initialization** | Create unique key: `agent:<id>:subagent:<uuid>` |
+| **System Prompt Prep** | Build specialized subagent prompt emphasizing task focus |
+| **Gateway Dispatch** | Send to Gateway via `agent` method in `subagent` lane |
+
+---
 
 ## Phase 2: Registration & Monitoring
 
 As soon as the task is accepted, it is recorded in the `SubagentRegistry`.
--   **Run Record**: A `SubagentRunRecord` is created, tracking the original task, parent session, and expected behavior (timeouts, cleanup policy).
--   **Event Listening**: The registry starts listening for global agent events. It specifically watches for `lifecycle` events (`start`, `end`, `error`) associated with the subagent's `runId`.
--   **Gateway Wait**: The system proactively calls `agent.wait` (a non-blocking Gateway RPC) to be notified as soon as the run finishes.
+
+### SubagentRunRecord
+
+```typescript
+{
+  runId: "uuid",                    // Unique run identifier
+  childSessionKey: "agent:...",     // Subagent's session
+  requesterSessionKey: "agent:...", // Parent's session
+  task: "Original task text",       // For reference
+  cleanup: "keep" | "delete",       // Retention policy
+  label: "Task Name",               // Human-readable
+  createdAt: 1706621234567,         // Timestamp
+  startedAt: null,                  // Set when execution begins
+  endedAt: null,                    // Set when completed
+  outcome: null                     // Set to ok|error|timeout
+}
+```
+
+### Monitoring Setup
+
+```mermaid
+graph LR
+    R[Registry] -->|"Listens for"| E[Event System]
+    R -->|"Waits via"| G["Gateway (agent.wait)"]
+    
+    E -->|"lifecycle:start"| R
+    E -->|"lifecycle:end"| R
+    E -->|"lifecycle:error"| R
+```
+
+---
 
 ## Phase 3: Active Execution
 
-The subagent runs in its isolated environment.
--   **Context Isolation**: It only has access to its own transcript and the specific instructions provided in the `task`.
--   **Tool Usage**: It can use any tools allowed by its agent profile (e.g., searching the web, reading files).
--   **Interim Updates**: While running, it emits `tool:start` and `assistant:text` events, which can be monitored for real-time dashboards or debugging.
+The subagent runs in its isolated environment, completely independent of the parent.
+
+### Isolation Properties
+
+| Aspect | Behavior |
+|:-------|:---------|
+| **Context** | Only sees its own transcript and task instructions |
+| **Tools** | Uses tools allowed by its agent profile |
+| **History** | No access to parent's conversation history |
+| **Events** | Emits `tool:start`, `assistant:text` for monitoring |
+
+### Event Timeline Example
+
+```mermaid
+gantt
+    title Subagent Execution Timeline
+    dateFormat X
+    axisFormat %s
+    
+    section Lifecycle
+    Start Event           :milestone, m1, 0, 0
+    End Event            :milestone, m2, 10, 0
+    
+    section Tool Calls
+    web_search           :active, t1, 1, 3
+    read (file)          :active, t2, 4, 2
+    
+    section Output
+    Thinking             :o1, 6, 2
+    Final Response       :o2, 8, 2
+```
+
+---
 
 ## Phase 4: Completion & Outcome
 
-When the subagent finishing its task:
--   **Status Capture**: The system captures the final status (`ok`, `error`, or `timeout`).
--   **Result Retrieval**: The latest assistant reply is read from the subagent's transcript. This represents the "findings" of the subagent.
--   **Usage Statistics**: The system calculates the runtime duration, total input/output tokens, and estimated cost based on the model's pricing profile.
+When the subagent finishes its task, the system captures the final state.
+
+### Outcome Types
+
+| Status | Meaning | Cause |
+|:-------|:--------|:------|
+| `ok` | Completed successfully | Normal completion |
+| `error` | Failed with error | Exception, tool failure |
+| `timeout` | Exceeded time limit | `runTimeoutSeconds` reached |
+| `unknown` | Status undetermined | Rare edge case |
+
+### Stats Collection
+
+Upon completion, the system gathers:
+
+```mermaid
+graph TD
+    C[Completion] --> S[Stats Collection]
+    
+    S --> D["Duration<br/>(endedAt - startedAt)"]
+    S --> T["Token Usage<br/>(input + output)"]
+    S --> Cost["Estimated Cost<br/>(model pricing)"]
+    S --> R["Result Text<br/>(final response)"]
+```
+
+---
 
 ## Phase 5: Result Delivery (The Announce Flow)
 
-The `runSubagentAnnounceFlow` is triggered to deliver the results back to the parent.
--   **Trigger Message**: A structured message is built for the parent agent, containing the findings and stats.
--   **Steering**: If the parent is currently active, the system attempts to "steer" (inject) this information directly into the parent's current thought process.
--   **Follow-up**: If the parent is idle, the system sends a follow-up message, triggering the parent to process the new information.
--   **Natural Language Generation**: The parent agent receives the trigger message and generates a natural, conversational update for the user (unless it's an internal task).
+The `runSubagentAnnounceFlow` function handles result delivery to the parent.
+
+### Trigger Message Format
+
+```
+A background task "${label}" just ${statusLabel}.
+
+Findings:
+${reply || "(no output)"}
+
+Stats: runtime 2m34s • tokens 15.2k (in 12.1k / out 3.1k) • est $0.42
+
+Summarize this naturally for the user. Keep it brief (1-2 sentences).
+Do not mention technical details like tokens or stats.
+You can respond with NO_REPLY if no announcement is needed.
+```
+
+### Delivery Decision
+
+```mermaid
+flowchart TD
+    A[Announce Flow Triggered] --> B{Is Parent Active?}
+    
+    B -->|Yes| C{Steering enabled?}
+    B -->|No| D[Queue as Follow-up]
+    
+    C -->|Yes| E[Steer: Inject into context]
+    C -->|No| D
+    
+    E --> F{Injection successful?}
+    F -->|Yes| G[✅ Steered]
+    F -->|No| D
+    
+    D --> H[✅ Queued for later]
+```
+
+---
 
 ## Phase 6: Post-Processing & Cleanup
 
--   **Session Retention**: Depending on the `cleanup` parameter, the session is either marked for archival or immediately deleted.
--   **Registry Sweeping**: A background "sweeper" periodically removes expired runs from the registry and deletes associated files to free up disk space.
--   **Persistence**: The entire registry is saved to disk, ensuring that even if OpenClaw restarts, pending subagent tasks and results are not lost.
+### Retention Policy
 
-**Code References**:
-- `src/agents/subagent-registry.ts`: Logic for tracking and monitoring runs.
-- `src/agents/subagent-announce.ts`: Logic for result delivery and stats calculation.
+| `cleanup` Value | Behavior |
+|:----------------|:---------|
+| `keep` | Session archived after `archiveAfterMinutes` |
+| `delete` | Session and transcript deleted immediately |
+
+### Cleanup Process
+
+```mermaid
+sequenceDiagram
+    participant R as Registry
+    participant S as Sweeper
+    participant G as Gateway
+    participant FS as File System
+    
+    Note over S: Runs periodically
+    
+    S->>R: Check expired runs
+    R-->>S: List of runs past archiveAtMs
+    
+    loop For each expired run
+        alt cleanup: "delete"
+            S->>G: sessions.delete(key)
+            G->>FS: Delete transcript file
+        else cleanup: "keep"
+            S->>R: Remove from active registry
+        end
+    end
+    
+    S->>R: Persist registry to disk
+```
+
+### Persistence for Recovery
+
+The registry is saved to disk to survive application restarts:
+
+- **On shutdown**: Registry persisted to JSON file
+- **On startup**: `restoreSubagentRunsOnce()` resumes monitoring incomplete runs
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Solution |
+|:--------|:-------------|:---------|
+| Subagent never completes | Infinite loop in task | Set `runTimeoutSeconds` |
+| Results not delivered | Parent session closed | Check parent session state |
+| High token usage | Overly broad task | Be more specific in task |
+| Cleanup not happening | Sweeper not running | Check process health |
+
+---
+
+## Code References
+
+- **Registry Logic**: `src/agents/subagent-registry.ts`
+- **Announce Flow**: `src/agents/subagent-announce.ts`
+- **Registry Persistence**: `src/agents/subagent-registry.store.ts`

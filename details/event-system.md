@@ -4,55 +4,215 @@
 
 The Event System is the central nervous system of OpenClaw, providing real-time visibility into agent activities for monitoring, logging, and coordination. It uses a monotonic sequence and timestamped payloads to ensure all actions are tracked accurately.
 
+---
+
+## Quick Reference
+
+| Concept | Description |
+|:--------|:------------|
+| **Event** | A timestamped record of agent activity |
+| **Stream** | Category of event (lifecycle, tool, assistant, error) |
+| **RunId** | Unique identifier linking events to a specific execution |
+| **Seq** | Monotonic sequence number within a run |
+
+---
+
 ## 1. Event Structure
 
 Every event in the system follows a standard `AgentEventPayload` structure:
 
 ```typescript
 type AgentEventPayload = {
-  runId: string;           // Unique identifier for the agent execution run
-  seq: number;             // Monotonic sequence number per run
-  stream: AgentEventStream; // The type of event (see below)
-  ts: number;              // Timestamp in milliseconds
-  data: Record<string, unknown>; // Event-specific data
-  sessionKey?: string;     // Associated session (optional)
+  runId: string;            // Unique identifier for the agent run
+  seq: number;              // Monotonic sequence number (1, 2, 3...)
+  stream: AgentEventStream; // Event category
+  ts: number;               // Timestamp in milliseconds
+  data: Record<string, unknown>; // Event-specific payload
+  sessionKey?: string;      // Associated session (optional)
 };
 ```
+
+---
 
 ## 2. Event Streams
 
 Events are categorized into different streams based on their purpose:
 
-| Stream | Events | Description |
-| :--- | :--- | :--- |
-| `lifecycle` | `start`, `end`, `error` | Tracks the beginning and end of an agent run, including final outcomes. |
-| `tool` | `start`, `update`, `result` | Detailed tracking of tool execution, arguments, and return values. |
-| `assistant` | `text`, `reasoning`, `block` | Real-time streaming of model output (text and internal reasoning). |
-| `error` | - | Specific error events occurring during a run. |
+| Stream | Phase Events | Description | Example Use |
+|:-------|:-------------|:------------|:------------|
+| `lifecycle` | `start`, `end`, `error` | Run lifecycle events | Subagent monitoring |
+| `tool` | `start`, `update`, `result` | Tool execution tracking | Debugging, progress |
+| `assistant` | `text`, `reasoning`, `block` | Model output streaming | Real-time display |
+| `error` | - | Error details | Alerting, logging |
+
+### Stream Flow Diagram
 
 ```mermaid
 graph TD
-    A["Agent Run / Tool"] -->|"emitAgentEvent"| ES{Event System}
-    ES -->|"Append Line"| T[("Transcript (JSONL)")]
-    ES -->|"Notify Set"| L["Global Listeners"]
+    subgraph "Event Sources"
+        A["Agent Runner"]
+        T["Tool Executor"]
+        M["Model Inference"]
+    end
     
-    L --> R["Subagent Registry"]
-    L --> D["Real-time Dashboard"]
-    L --> LG["Diagnostic logs"]
+    subgraph "Event System"
+        E{{"emitAgentEvent()"}}
+    end
     
-    R -->|"Check runId"| Finish["Trigger Announce"]
+    subgraph "Consumers"
+        TR[("Transcript<br/>(JSONL)")]
+        L["Global Listeners"]
+        SR["Subagent Registry"]
+        DB["Real-time Dashboard"]
+        LG["Diagnostic Logs"]
+    end
+    
+    A -->|lifecycle| E
+    T -->|tool| E
+    M -->|assistant| E
+    
+    E -->|Append| TR
+    E -->|Notify| L
+    
+    L --> SR
+    L --> DB
+    L --> LG
+    
+    SR -->|"Check runId"| AN["Trigger Announce"]
 ```
 
-## 3. Emitting and Listening
+---
 
-The system provides a simple interface for emitting and subscribing to events.
+## 3. Event Examples
 
-### 3.1 Emitting Events
-Agents and tools emit events using `emitAgentEvent`. The system automatically manages the sequence number (`seq`) and timestamp (`ts`).
+### Lifecycle Events
+
+**Run Start**
+```json
+{
+  "runId": "abc-123",
+  "seq": 1,
+  "stream": "lifecycle",
+  "ts": 1706621234567,
+  "data": {
+    "phase": "start",
+    "sessionKey": "agent:coder:subagent:xyz",
+    "model": "anthropic/claude-sonnet"
+  }
+}
+```
+
+**Run End**
+```json
+{
+  "runId": "abc-123",
+  "seq": 15,
+  "stream": "lifecycle",
+  "ts": 1706621250000,
+  "data": {
+    "phase": "end",
+    "outcome": "ok",
+    "inputTokens": 1200,
+    "outputTokens": 350
+  }
+}
+```
+
+### Tool Events
+
+**Tool Start**
+```json
+{
+  "runId": "abc-123",
+  "seq": 5,
+  "stream": "tool",
+  "ts": 1706621238000,
+  "data": {
+    "phase": "start",
+    "name": "web_search",
+    "toolCallId": "call_1",
+    "args": { "query": "OpenClaw documentation" }
+  }
+}
+```
+
+**Tool Result**
+```json
+{
+  "runId": "abc-123",
+  "seq": 6,
+  "stream": "tool",
+  "ts": 1706621240000,
+  "data": {
+    "phase": "result",
+    "name": "web_search",
+    "toolCallId": "call_1",
+    "result": "Found 5 results..."
+  }
+}
+```
+
+### Assistant Events
+
+**Text Streaming**
+```json
+{
+  "runId": "abc-123",
+  "seq": 10,
+  "stream": "assistant",
+  "ts": 1706621245000,
+  "data": {
+    "phase": "text",
+    "delta": "The latest Node.js LTS version is",
+    "accumulated": "The latest Node.js LTS version is"
+  }
+}
+```
+
+---
+
+## 4. Event Timeline
+
+A typical agent run produces events in this sequence:
+
+```mermaid
+sequenceDiagram
+    participant R as Agent Run
+    participant E as Event System
+    participant T as Transcript
+    participant L as Listeners
+    
+    R->>E: lifecycle:start (seq=1)
+    E->>T: Append to JSONL
+    E->>L: Notify listeners
+    
+    R->>E: tool:start (seq=2)
+    R->>E: tool:result (seq=3)
+    
+    R->>E: assistant:text (seq=4)
+    R->>E: assistant:text (seq=5)
+    R->>E: assistant:text (seq=6)
+    
+    R->>E: tool:start (seq=7)
+    R->>E: tool:result (seq=8)
+    
+    R->>E: assistant:text (seq=9)
+    
+    R->>E: lifecycle:end (seq=10)
+    E->>L: Notify (triggers announce)
+```
+
+---
+
+## 5. Emitting and Listening
+
+### Emitting Events
+
+Agents and tools emit events using `emitAgentEvent`. The system automatically manages the sequence number and timestamp.
 
 ```typescript
 emitAgentEvent({
-  runId: "run-123",
+  runId: "abc-123",
   stream: "tool",
   data: {
     phase: "start",
@@ -60,28 +220,106 @@ emitAgentEvent({
     args: { path: "hello.txt" }
   }
 });
+// seq and ts are auto-populated
 ```
 
-### 3.2 Listening for Events
-Any part of the system can subscribe to events using `onAgentEvent`.
+### Listening for Events
+
+Any part of the system can subscribe to events using `onAgentEvent`:
 
 ```typescript
 const unsubscribe = onAgentEvent((evt) => {
-  if (evt.stream === "lifecycle" && evt.data.phase === "end") {
-    console.log(`Run ${evt.runId} completed successfully.`);
+  // Filter by stream
+  if (evt.stream === "lifecycle") {
+    if (evt.data.phase === "start") {
+      console.log(`Run ${evt.runId} started`);
+    }
+    if (evt.data.phase === "end") {
+      console.log(`Run ${evt.runId} completed`);
+    }
+  }
+  
+  // Filter by runId
+  if (evt.runId === targetRunId && evt.stream === "tool") {
+    console.log(`Tool ${evt.data.name}: ${evt.data.phase}`);
   }
 });
 
-// To stop listening:
+// Stop listening when done
 unsubscribe();
 ```
 
-## 4. Run Context
+---
 
-The system can associate a `runId` with a specific context (like a `sessionKey`) using `registerAgentRunContext`. This metadata is automatically fetched and added to every event emitted for that `runId`, eliminating the need to pass it manually every time.
+## 6. Run Context
 
-## 5. Persistence
+The system can associate a `runId` with metadata using `registerAgentRunContext`:
 
-Every event emitted is logged as a line in a JSONL (JSON Lines) file associated with the session. This transcript serves as the permanent record of the interaction and is used for history management and debugging.
+```typescript
+registerAgentRunContext(runId, {
+  sessionKey: "agent:main:user-123",
+  agentId: "main"
+});
 
-**Code Reference**: `src/infra/agent-events.ts`.
+// Now all events for this runId automatically include sessionKey
+```
+
+This eliminates the need to pass `sessionKey` with every event emission.
+
+---
+
+## 7. Persistence
+
+Every event is appended to the session's transcript file:
+
+| Aspect | Details |
+|:-------|:--------|
+| **Location** | `~/.clawdbot/agents/<agentId>/sessions/<sessionId>.jsonl` |
+| **Format** | One JSON object per line |
+| **Benefits** | Streaming writes, easy replay, debugging |
+
+### Transcript Example
+
+```jsonl
+{"runId":"abc-123","seq":1,"stream":"lifecycle","ts":1706621234567,"data":{"phase":"start"}}
+{"runId":"abc-123","seq":2,"stream":"tool","ts":1706621235000,"data":{"phase":"start","name":"web_search"}}
+{"runId":"abc-123","seq":3,"stream":"tool","ts":1706621237000,"data":{"phase":"result","name":"web_search"}}
+{"runId":"abc-123","seq":4,"stream":"assistant","ts":1706621238000,"data":{"phase":"text","delta":"Hello"}}
+```
+
+---
+
+## 8. Common Patterns
+
+### Waiting for Run Completion
+
+```typescript
+const waitForRun = (targetRunId: string): Promise<void> => {
+  return new Promise((resolve) => {
+    const unsubscribe = onAgentEvent((evt) => {
+      if (evt.runId === targetRunId && 
+          evt.stream === "lifecycle" && 
+          (evt.data.phase === "end" || evt.data.phase === "error")) {
+        unsubscribe();
+        resolve();
+      }
+    });
+  });
+};
+```
+
+### Monitoring Tool Progress
+
+```typescript
+onAgentEvent((evt) => {
+  if (evt.stream === "tool" && evt.data.phase === "update") {
+    updateProgressBar(evt.data.progress);
+  }
+});
+```
+
+---
+
+## Code Reference
+
+- **Event System**: `src/infra/agent-events.ts`

@@ -4,6 +4,58 @@ This document outlines the complete architectural implementation of OpenClaw's h
 
 ---
 
+## Quick Understanding
+
+> **What is A2A?** A system where a main agent can spawn specialized background agents to handle complex tasks in parallel, then receive and summarize their results naturally.
+
+### The Core Concept
+
+```mermaid
+graph LR
+    U[User] <-->|"Chats with"| M[Main Agent]
+    M -->|"Spawns"| S1[Subagent: Research]
+    M -->|"Spawns"| S2[Subagent: Coding]
+    S1 -.->|"Results"| M
+    S2 -.->|"Results"| M
+    M -->|"Summarizes"| U
+```
+
+### Why A2A?
+
+| Problem | A2A Solution |
+|:--------|:-------------|
+| Long tasks block conversation | Subagents work in background |
+| Context window pollution | Each subagent has clean context |
+| One-size-fits-all tools | Specialized agents with focused tools |
+| All-or-nothing responses | Parallel work with progressive updates |
+
+---
+
+## Component Overview
+
+| Component | Purpose | Documentation |
+|:----------|:--------|:--------------|
+| **Core Principles** | The four pillars of A2A design | [Details →](details/core-principles.md) |
+| **Agent Configuration** | Defining agent identities and capabilities | [Details →](details/agent-configuration.md) |
+| **Session Management** | How conversation state is maintained | [Details →](details/session-management.md) |
+| **The `sessions_spawn` Tool** | The gateway to task delegation | [Details →](details/sessions-spawn-tool.md) |
+| **Execution Lifecycle** | What happens when a subagent runs | [Details →](details/execution-lifecycle.md) |
+| **Event System** | Real-time activity monitoring | [Details →](details/event-system.md) |
+| **Execution Lanes** | Parallel processing without blocking | [Details →](details/execution-lanes.md) |
+| **Queue Modes** | How results are delivered back | [Details →](details/queue-modes.md) |
+| **Tool System** | Managing agent capabilities | [Details →](details/tool-system.md) |
+| **System Prompts** | Dynamic instruction construction | [Details →](details/system-prompt.md) |
+| **Gateway RPC Layer** | The communication backbone | [Details →](details/gateway-rpc.md) |
+| **Tool Reference** | Complete list of available tools | [Details →](details/tool-reference.md) |
+
+---
+
+## Architecture Diagram
+
+![Architecture](image.png)
+
+---
+
 ## Table of Contents
 
 1. [Core Principles](#1-core-principles)
@@ -26,21 +78,18 @@ This document outlines the complete architectural implementation of OpenClaw's h
 
 The OpenClaw A2A architecture is built on four pillars:
 
-1. **Strict Isolation**: Subagents run in dedicated sessions with their own history and temporary workspace. Each session key is unique (`agent:<AgentId>:subagent:<UUID>`).
-
-2. **Event-Driven Feedback**: Parent agents are updated via a background registry that monitors subagent lifecycle events (`start`, `end`, `error`).
-
-3. **Seamless Re-integration**: Results from subagents are "steered" back into the parent's thought process naturally using an injection mechanism, or delivered as a follow-up message if the parent is idle.
-
-4. **Hierarchical Agent Identity**: Agents are identified by unique IDs (e.g., `main`, `researcher`, `coder`) and can be configured with different models, tool profiles, and capabilities.
-
-![Architecture](image.png)
+| Principle | What It Means |
+|:----------|:--------------|
+| **Strict Isolation** | Subagents run in dedicated sessions with own history and workspace |
+| **Event-Driven Feedback** | Parent agents updated via lifecycle events (`start`, `end`, `error`) |
+| **Seamless Re-integration** | Results "steered" into parent context or sent as follow-up |
+| **Hierarchical Identity** | Agents identified by unique IDs with different capabilities |
 
 ---
 
 ## 2. Agent Configuration ([Detailed Documentation](details/agent-configuration.md))
 
-### 2.1 Agent Identity
+### Agent Identity
 
 Agents are defined in the configuration under `agents.list`:
 
@@ -60,735 +109,235 @@ agents:
       name: "Research Specialist"
       workspace: ~/research-workspace
       subagents:
-        allowAgents: ["*"]  # Can spawn any agent
+        allowAgents: ["*"]
     - id: coder
       name: "Coding Agent"
 ```
 
-### 2.2 Key Configuration Options
+### Key Configuration Options
 
 | Option | Description |
-| :--- | :--- |
+|:-------|:------------|
 | `id` | Unique agent identifier (normalized to lowercase) |
 | `name` | Human-readable display name |
-| `default` | If `true`, this agent handles unassigned sessions |
-| `workspace` | Root directory for agent file operations |
-| `agentDir` | Directory for agent-specific state/transcripts |
-| `model` | Primary model (e.g., `anthropic/claude-sonnet`) or object with `primary` and `fallbacks` |
-| `subagents.allowAgents` | List of agent IDs this agent can spawn (`["*"]` for any) |
-| `subagents.model` | Default model override for spawned subagents |
+| `default` | If `true`, handles unassigned sessions |
+| `workspace` | Root directory for file operations |
+| `model` | Primary model or `{primary, fallbacks}` config |
+| `subagents.allowAgents` | List of agents this agent can spawn (`["*"]` for any) |
 | `tools` | Tool policy (allow/deny lists) |
-| `sandbox` | Sandbox configuration (Docker, security, etc.) |
-
-### 2.3 Agent Resolution
-
-When resolving which agent handles a request:
-
-1. Parse the session key to extract `agentId` (e.g., `agent:researcher:abc123` → `researcher`)
-2. If no agent ID in session key, use `defaultAgentId` (the first agent with `default: true`)
-3. Load agent-specific configuration including workspace, model, and tool policies
-
-**Code Reference**: `src/agents/agent-scope.ts`
 
 ---
 
 ## 3. Session Management ([Detailed Documentation](details/session-management.md))
 
-### 3.1 Session Key Format
-
-Session keys uniquely identify each conversation context:
+### Session Key Format
 
 | Format | Example | Description |
-| :--- | :--- | :--- |
+|:-------|:--------|:------------|
 | `agent:<agentId>:<slug>` | `agent:main:telegram-123` | Standard agent session |
 | `agent:<agentId>:subagent:<uuid>` | `agent:coder:subagent:a1b2c3d4` | Spawned subagent session |
 | `main` (alias) | - | Alias for the main/default session |
-| `global` | - | Global shared context |
 
-### 3.2 Session Entry Structure
+### Session Entry Fields
 
-Each session maintains:
-
-```typescript
-type SessionEntry = {
-  sessionId: string;           // UUID for this session
-  sessionKey: string;          // Canonical key
-  channel?: string;            // telegram, discord, web, etc.
-  lastChannel?: string;        // Last active channel
-  model?: string;              // Active model
-  modelProvider?: string;      // Provider (anthropic, openai, etc.)
-  inputTokens?: number;        // Token usage tracking
-  outputTokens?: number;
-  totalTokens?: number;
-  spawnedBy?: string;          // Parent session key (for subagents)
-  label?: string;              // Human-readable label
-  // ... more fields
-};
-```
-
-### 3.3 Transcript Persistence
-
-- Session transcripts are stored as JSONL files: `~/.clawdbot/agents/<agentId>/sessions/<sessionId>.jsonl`
-- Each line is a JSON object representing a message turn
-- The session store (JSON) tracks session metadata separately from transcript content
-
-**Code Reference**: `src/config/sessions.ts`, `src/gateway/session-utils.ts`
+| Field | Purpose |
+|:------|:--------|
+| `sessionId` | UUID for this session |
+| `sessionKey` | Canonical key |
+| `spawnedBy` | Parent session key (for subagents) |
+| `model` | Active model |
+| `inputTokens` / `outputTokens` | Token usage tracking |
 
 ---
 
 ## 4. The `sessions_spawn` Tool ([Detailed Documentation](details/sessions-spawn-tool.md))
 
-The primary gateway for A2A interaction is the `sessions_spawn` tool. This tool allows an agent to create a background process to handle a specific task.
-
-### 4.1 Parameters
+### Parameters
 
 | Parameter | Type | Required | Description |
-| :--- | :--- | :--- | :--- |
+|:----------|:-----|:---------|:------------|
 | `task` | string | ✓ | Natural language instruction for the subagent |
-| `label` | string | | Short, human-readable label (e.g., "research-task") |
+| `label` | string | | Short, human-readable label |
 | `agentId` | string | | Target agent profile (inherits parent's if omitted) |
-| `model` | string | | Override model (e.g., `anthropic/claude-opus`) |
-| `thinking` | string | | Override thinking/reasoning level |
+| `model` | string | | Override model |
 | `runTimeoutSeconds` | number | | Maximum duration before timeout |
-| `cleanup` | `"keep"` \| `"delete"` | | Session retention policy (default: `keep`) |
+| `cleanup` | `"keep"` \| `"delete"` | | Session retention policy |
 
-### 4.2 Validation & Policy
+### Safety Features
 
-**Recursion Guard**: The tool explicitly checks if the requester is already a subagent. If so, spawning is rejected (`forbidden`), preventing infinite recursion loops.
+- **Recursion Guard**: Subagents cannot spawn other subagents
+- **Permission Check**: `agentId` validated against `subagents.allowAgents`
 
-```typescript
-if (isSubagentSessionKey(requesterSessionKey)) {
-  return { status: "forbidden", error: "sessions_spawn is not allowed from sub-agent sessions" };
-}
-```
-
-**Permission Check**: The `agentId` parameter is validated against the parent's `subagents.allowAgents` configuration:
-
-- `["*"]` → Can spawn any agent
-- `["coder", "researcher"]` → Can only spawn these specific agents
-- Empty/undefined → Can only spawn self (same agentId)
-
-### 4.3 Return Value
+### Return Value
 
 ```json
 {
   "status": "accepted",
   "childSessionKey": "agent:coder:subagent:a1b2c3d4-e5f6-...",
-  "runId": "uuid-of-the-run",
-  "modelApplied": true
+  "runId": "uuid-of-the-run"
 }
 ```
-
-**Code Reference**: `src/agents/tools/sessions-spawn-tool.ts`
 
 ---
 
 ## 5. The Execution Lifecycle ([Detailed Documentation](details/execution-lifecycle.md))
 
-### Step 1: Spawning
-
-When `sessions_spawn` is called:
-
-1. **Session Key Generation**: A unique session key is generated: `agent:<AgentId>:subagent:<UUID>`
-
-2. **System Prompt Injection**: A specialized Subagent System Prompt is built (see Section 10)
-
-3. **Model Configuration**: If specified, the model is patched onto the child session via `sessions.patch`
-
-4. **Gateway Dispatch**: The agent is executed via the gateway's `agent` method:
-   ```typescript
-   await callGateway({
-     method: "agent",
-     params: {
-       message: task,
-       sessionKey: childSessionKey,
-       lane: AGENT_LANE_SUBAGENT,  // "subagent"
-       extraSystemPrompt: childSystemPrompt,
-       spawnedBy: requesterSessionKey,
-       // ...
-     }
-   });
-   ```
-
-### Step 2: Registry & Monitoring (SubagentRegistry)
-
-The `SubagentRegistry` is the central nervous system tracking background tasks.
-
-**SubagentRunRecord Structure**:
-```typescript
-type SubagentRunRecord = {
-  runId: string;                    // Unique run identifier
-  childSessionKey: string;          // Subagent's session
-  requesterSessionKey: string;      // Parent's session
-  requesterOrigin?: DeliveryContext; // Reply routing info
-  task: string;                     // Original task
-  cleanup: "delete" | "keep";       // Retention policy
-  label?: string;                   // Human-readable label
-  createdAt: number;                // Timestamp
-  startedAt?: number;               // When execution began
-  endedAt?: number;                 // When execution completed
-  outcome?: SubagentRunOutcome;     // ok | error | timeout
-  archiveAtMs?: number;             // Scheduled cleanup time
-};
+```mermaid
+stateDiagram-v2
+    [*] --> Spawning: Parent calls sessions_spawn
+    Spawning --> Registration: Gateway accepts
+    Registration --> ActiveExecution: Monitoring
+    ActiveExecution --> Completion: Task done
+    Completion --> ResultDelivery: Announce flow
+    ResultDelivery --> Cleanup: Policy applied
+    Cleanup --> [*]
 ```
 
-**Key Functions**:
-- `registerSubagentRun()`: Adds run to registry, starts monitoring
-- `waitForSubagentCompletion()`: Uses `agent.wait` RPC to wait for completion
-- `sweepSubagentRuns()`: Periodically cleans up expired runs
-- `persistSubagentRuns()`: Saves registry to disk for restart recovery
+### Key Phases
 
-**Persistence**: Registry is persisted to disk to survive application restarts. On startup, `restoreSubagentRunsOnce()` resumes monitoring of incomplete runs.
-
-**Code Reference**: `src/agents/subagent-registry.ts`, `src/agents/subagent-registry.store.ts`
-
-### Step 3: Event Listening
-
-The registry listens to global agent events:
-
-```typescript
-onAgentEvent((evt) => {
-  if (evt.stream !== "lifecycle") return;
-  const entry = subagentRuns.get(evt.runId);
-  
-  if (evt.data.phase === "start") {
-    entry.startedAt = evt.data.startedAt;
-  }
-  if (evt.data.phase === "end" || evt.data.phase === "error") {
-    entry.endedAt = evt.data.endedAt;
-    entry.outcome = { status: evt.data.phase === "error" ? "error" : "ok" };
-    // Trigger announce flow
-    runSubagentAnnounceFlow({ ... });
-  }
-});
-```
-
-### Step 4: Completion & Stats
-
-Once the subagent finishes (or times out):
-
-1. **Result Retrieval**: Read the latest assistant reply from the subagent's transcript:
-   ```typescript
-   const reply = await readLatestAssistantReply({ sessionKey: childSessionKey });
-   ```
-
-2. **Stats Compilation**: Usage metrics are gathered:
-   - Runtime duration (from `startedAt` to `endedAt`)
-   - Token usage (input / output / total)
-   - Estimated cost (based on model pricing config)
-   - Session IDs and transcript paths
-
-3. **Status Resolution**:
-   - `"ok"`: Completed successfully
-   - `"error"`: Failed with error message
-   - `"timeout"`: Exceeded `runTimeoutSeconds`
-   - `"unknown"`: Status could not be determined
-
-### Step 5: Steering & Feedback (Announce Flow)
-
-The `runSubagentAnnounceFlow()` function handles result delivery to the parent:
-
-**Trigger Message Construction**:
-```
-A background task "${label}" just ${statusLabel}.
-
-Findings:
-${reply || "(no output)"}
-
-Stats: runtime 2m34s • tokens 15.2k (in 12.1k / out 3.1k) • est $0.42
-
-Summarize this naturally for the user. Keep it brief (1-2 sentences).
-Do not mention technical details like tokens or stats.
-You can respond with NO_REPLY if no announcement is needed.
-```
-
-**Delivery Modes** (based on queue settings):
-
-| Mode | Behavior |
-| :--- | :--- |
-| `steer` | **Inject** directly into parent's context window while it's running |
-| `followup` | Send as a new message, triggering a new parent run |
-| `collect` | Queue messages, deliver as batched summary |
-| `steer-backlog` | Try steering; if parent idle, queue for later |
-| `interrupt` | Queue then force parent to process |
-
-**Steering Logic**:
-```typescript
-if (shouldSteer && isEmbeddedPiRunActive(sessionId)) {
-  const steered = queueEmbeddedPiMessage(sessionId, triggerMessage);
-  if (steered) return "steered";
-}
-```
-
-**Code Reference**: `src/agents/subagent-announce.ts`, `src/agents/subagent-announce-queue.ts`
-
-### Step 6: Cleanup
-
-- **Archive/Sweep**: Completed runs are kept for `archiveAfterMinutes` (default: 60) before being swept
-- **Session Deletion**: If `cleanup: "delete"` was specified:
-  ```typescript
-  await callGateway({
-    method: "sessions.delete",
-    params: { key: childSessionKey, deleteTranscript: true }
-  });
-  ```
+| Phase | Key Actions |
+|:------|:------------|
+| **Spawning** | Key generation, prompt prep, gateway dispatch |
+| **Registration** | Registry entry, event listening begins |
+| **Active Execution** | Task work in isolated session |
+| **Completion** | Status capture, result retrieval |
+| **Result Delivery** | Steering or follow-up message |
+| **Cleanup** | Archive or delete session |
 
 ---
 
 ## 6. Event System ([Detailed Documentation](details/event-system.md))
 
-### 6.1 Agent Events
-
-The event system (`src/infra/agent-events.ts`) provides real-time updates on agent activity:
-
-**Event Structure**:
-```typescript
-type AgentEventPayload = {
-  runId: string;           // Unique run identifier
-  seq: number;             // Monotonic sequence number per run
-  stream: AgentEventStream; // "lifecycle" | "tool" | "assistant" | "error"
-  ts: number;              // Timestamp
-  data: Record<string, unknown>;
-  sessionKey?: string;     // Associated session
-};
-```
-
-**Event Streams**:
+### Event Streams
 
 | Stream | Events | Description |
-| :--- | :--- | :--- |
+|:-------|:-------|:------------|
 | `lifecycle` | `start`, `end`, `error` | Run lifecycle events |
 | `tool` | `start`, `update`, `result` | Tool execution events |
 | `assistant` | `text`, `reasoning`, `block` | Assistant output events |
-| `error` | Error details | Error information |
 
-**Emitting Events**:
+### Event Structure
+
 ```typescript
-emitAgentEvent({
-  runId: params.runId,
-  stream: "tool",
-  data: {
-    phase: "start",
-    name: toolName,
-    toolCallId,
-    args: { ... }
-  }
-});
+type AgentEventPayload = {
+  runId: string;      // Unique run identifier
+  seq: number;        // Monotonic sequence number
+  stream: string;     // Event category
+  ts: number;         // Timestamp
+  data: object;       // Event-specific data
+};
 ```
-
-**Listening to Events**:
-```typescript
-const unsubscribe = onAgentEvent((evt) => {
-  if (evt.stream === "lifecycle" && evt.data.phase === "end") {
-    console.log(`Run ${evt.runId} completed`);
-  }
-});
-// Later: unsubscribe();
-```
-
-**Code Reference**: `src/infra/agent-events.ts`
 
 ---
 
 ## 7. Execution Lanes ([Detailed Documentation](details/execution-lanes.md))
 
-Lanes provide isolation and prioritization for different types of agent runs:
-
-### 7.1 Lane Types
-
-```typescript
-export const enum CommandLane {
-  Main = "main",         // Primary user-facing runs
-  Cron = "cron",         // Scheduled/automated runs
-  Subagent = "subagent", // Spawned subagent runs
-  Nested = "nested",     // Nested tool executions
-}
-```
-
-### 7.2 Lane Behavior
-
 | Lane | Description | Blocking |
-| :--- | :--- | :--- |
-| `main` | Primary conversation, user messages | Yes (serialized per session) |
-| `cron` | Scheduled tasks, heartbeats | No (parallel) |
-| `subagent` | Background subagent runs | No (parallel) |
+|:-----|:------------|:---------|
+| `main` | Primary user conversations | Serialized per session |
+| `subagent` | Background subagent runs | Parallel |
+| `cron` | Scheduled tasks | Parallel |
 | `nested` | Tool-invoked sub-runs | Depends on parent |
 
-### 7.3 Lane Resolution
+### Why Lanes Matter
 
-When spawning a subagent:
-```typescript
-await callGateway({
-  method: "agent",
-  params: {
-    lane: AGENT_LANE_SUBAGENT,  // "subagent"
-    // ...
-  }
-});
-```
-
-The gateway routes the run to the appropriate lane, preventing subagent runs from blocking main conversation flow.
-
-**Code Reference**: `src/process/lanes.ts`, `src/agents/lanes.ts`
+Lanes ensure subagents run in parallel without blocking user conversations.
 
 ---
 
 ## 8. Queue Modes & Message Steering ([Detailed Documentation](details/queue-modes.md))
 
-### 8.1 Queue Mode Types
-
-```typescript
-type QueueMode = "steer" | "followup" | "collect" | "steer-backlog" | "interrupt" | "queue";
-```
-
-| Mode | Description |
-| :--- | :--- |
-| `steer` | Inject message into running agent's context (real-time) |
-| `followup` | Queue and send as new message when agent idle |
-| `collect` | Batch multiple messages into single summary |
-| `steer-backlog` | Try steer; fall back to queue if agent idle |
+| Mode | Behavior |
+|:-----|:---------|
+| `steer` | Inject into parent's active context window |
+| `followup` | Send as new message when parent idle |
+| `collect` | Batch multiple results into summary |
+| `steer-backlog` | Try steer; queue if parent idle |
 | `interrupt` | Force delivery, interrupting current work |
-| `queue` | Simple FIFO queue |
-
-### 8.2 Queue Settings
-
-```typescript
-type QueueSettings = {
-  mode: QueueMode;
-  debounceMs?: number;   // Wait before draining (default: 1000)
-  cap?: number;          // Max queue size (default: 20)
-  dropPolicy?: QueueDropPolicy;  // "old" | "new" | "summarize"
-};
-```
-
-### 8.3 Announce Queue
-
-The announce queue (`src/agents/subagent-announce-queue.ts`) manages subagent result delivery:
-
-```typescript
-enqueueAnnounce({
-  key: sessionKey,
-  item: {
-    prompt: triggerMessage,
-    summaryLine: taskLabel,
-    enqueuedAt: Date.now(),
-    sessionKey,
-    origin: deliveryContext
-  },
-  settings: queueSettings,
-  send: sendAnnounce
-});
-```
-
-**Drain Logic**:
-1. Wait for debounce period
-2. Check if cross-channel delivery needed (handle separately)
-3. For `collect` mode: batch all items with summary
-4. Send messages in order
-
-**Code Reference**: `src/agents/subagent-announce-queue.ts`, `src/auto-reply/reply/queue/`
 
 ---
 
 ## 9. Tool System ([Detailed Documentation](details/tool-system.md))
 
-### 9.1 Tool Profiles
+### Tool Groups
 
-Profiles define which tools are available to an agent:
+| Group | Included Tools |
+|:------|:---------------|
+| `group:fs` | `read`, `write`, `edit`, `apply_patch` |
+| `group:runtime` | `exec`, `process` |
+| `group:web` | `web_search`, `web_fetch` |
+| `group:sessions` | `sessions_spawn`, `sessions_list`, etc. |
 
-```typescript
-const TOOL_PROFILES = {
-  minimal: { allow: ["session_status"] },
-  coding: { allow: ["group:fs", "group:runtime", "group:sessions", "group:memory", "image"] },
-  messaging: { allow: ["group:messaging", "sessions_list", "sessions_history", "sessions_send", "session_status"] },
-  full: {},  // Everything allowed
-};
-```
+### Tool Profiles
 
-### 9.2 Tool Groups
-
-Tools are organized into logical groups:
-
-```typescript
-const TOOL_GROUPS = {
-  "group:memory": ["memory_search", "memory_get"],
-  "group:web": ["web_search", "web_fetch"],
-  "group:fs": ["read", "write", "edit", "apply_patch"],
-  "group:runtime": ["exec", "process"],
-  "group:sessions": ["sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status"],
-  "group:ui": ["browser", "canvas"],
-  "group:automation": ["cron", "gateway"],
-  "group:messaging": ["message"],
-  "group:nodes": ["nodes"],
-  "group:openclaw": [/* all native tools */],
-};
-```
-
-### 9.3 Tool Policy Resolution
-
-Tool access is determined by layered policies:
-
-1. **Profile Policy**: Base profile (`coding`, `full`, etc.)
-2. **Agent Config**: Per-agent `tools.allow` / `tools.deny`
-3. **Sandbox Policy**: Reduced tools when sandboxed
-4. **Runtime Context**: Session-specific overrides
-
-```typescript
-function resolveToolProfilePolicy(profile?: string): ToolProfilePolicy | undefined {
-  const resolved = TOOL_PROFILES[profile];
-  return {
-    allow: resolved.allow ? expandToolGroups(resolved.allow) : undefined,
-    deny: resolved.deny ? [...resolved.deny] : undefined,
-  };
-}
-```
-
-**Code Reference**: `src/agents/tool-policy.ts`
-
-### 9.4 Tool Execution Flow
-
-1. **Tool Call Start**: Agent requests tool execution
-2. **Event Emission**: `tool:start` event emitted
-3. **Execution**: Tool handler runs asynchronously
-4. **Progress Updates**: `tool:update` for long-running tools
-5. **Result**: `tool:result` event with output or error
-6. **Context Update**: Result added to session for next turn
-
-```typescript
-async function handleToolExecutionStart(ctx, evt) {
-  // Flush block replies before tool execution
-  ctx.flushBlockReplyBuffer();
-  
-  // Emit event
-  emitAgentEvent({
-    runId: ctx.params.runId,
-    stream: "tool",
-    data: { phase: "start", name: toolName, toolCallId, args }
-  });
-  
-  // Track messaging tools for deduplication
-  if (isMessagingTool(toolName)) {
-    ctx.state.pendingMessagingTargets.set(toolCallId, sendTarget);
-  }
-}
-```
-
-**Code Reference**: `src/agents/pi-embedded-subscribe.handlers.tools.ts`
+| Profile | Description |
+|:--------|:------------|
+| `minimal` | Only `session_status` |
+| `coding` | Full filesystem and runtime access |
+| `messaging` | Communication focused |
+| `full` | Everything allowed |
 
 ---
 
 ## 10. System Prompt Construction ([Detailed Documentation](details/system-prompt.md))
 
-### 10.1 Main Agent Prompt
+### Prompt Modes
 
-The main agent system prompt includes multiple sections:
+| Mode | Contents | Use For |
+|:-----|:---------|:--------|
+| **`full`** | All sections (Identity, Tools, Skills, Memory, etc.) | Main Agent |
+| **`minimal`** | Core sections (Identity, Tools, Workspace) | Subagents |
+| **`none`** | Basic identity only | Specialized runs |
 
-| Section | Contents |
-| :--- | :--- |
-| **Identity** | Agent name, personality, owner info |
-| **Runtime** | Agent ID, host, OS, model, workspace |
-| **Time** | Current timestamp, timezone |
-| **Workspace** | Working directory, docs path |
-| **Reply Tags** | Format for structured responses |
-| **Messaging** | Available channels, delivery hints |
-| **Skills** | Loaded skill prompts |
-| **Memory** | Memory search instructions |
-| **Voice** | TTS hints if enabled |
+### Subagent Prompt Focus
 
-**Prompt Modes**:
-- `full`: All sections (main agent)
-- `minimal`: Reduced sections (subagents)
-- `none`: Basic identity only
-
-**Code Reference**: `src/agents/system-prompt.ts`
-
-### 10.2 Subagent System Prompt
-
-Subagents receive a specialized prompt emphasizing task focus:
-
-```typescript
-function buildSubagentSystemPrompt(params) {
-  return `
-# Subagent Context
-
-You are a **subagent** spawned by the main agent for a specific task.
-
-## Your Role
-- You were created to handle: ${taskText}
-- Complete this task. That's your entire purpose.
-- You are NOT the main agent. Don't try to be.
-
-## Rules
-1. **Stay focused** - Do your assigned task, nothing else
-2. **Complete the task** - Your final message will be automatically reported
-3. **Don't initiate** - No heartbeats, no proactive actions, no side quests
-4. **Be ephemeral** - You may be terminated after task completion. That's fine.
-
-## Output Format
-When complete, your final response should include:
-- What you accomplished or found
-- Any relevant details the main agent should know
-- Keep it concise but informative
-
-## What You DON'T Do
-- NO user conversations (that's main agent's job)
-- NO external messages unless explicitly tasked
-- NO cron jobs or persistent state
-- NO pretending to be the main agent
-- NO using the \`message\` tool directly
-
-## Session Context
-- Label: ${label}
-- Requester session: ${requesterSessionKey}
-- Your session: ${childSessionKey}
-`;
-}
-```
-
-**Code Reference**: `src/agents/subagent-announce.ts`
+Subagents receive focused prompts emphasizing:
+- Task completion as sole purpose
+- No user interaction
+- Ephemeral nature
+- Concise output format
 
 ---
 
 ## 11. Gateway RPC Layer ([Detailed Documentation](details/gateway-rpc.md))
 
-### 11.1 Gateway Architecture
-
-The gateway provides a WebSocket-based RPC layer for agent coordination:
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   CLI/Client    │────▶│     Gateway     │────▶│   Agent Runner  │
-│                 │◀────│   (WebSocket)   │◀────│                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
-
-### 11.2 Key RPC Methods
+### Key RPC Methods
 
 | Method | Description |
-| :--- | :--- |
+|:-------|:------------|
 | `agent` | Execute an agent run |
 | `agent.wait` | Wait for a run to complete |
-| `agent.identity.get` | Get agent identity info |
-| `sessions.list` | List sessions |
 | `sessions.patch` | Update session metadata |
 | `sessions.delete` | Delete a session |
 | `chat.history` | Get session message history |
-| `chat.send` | Send a message to a channel |
-
-### 11.3 Calling the Gateway
-
-```typescript
-const result = await callGateway({
-  method: "agent",
-  params: {
-    message: task,
-    sessionKey: childSessionKey,
-    lane: "subagent",
-    // ...
-  },
-  timeoutMs: 10_000
-});
-```
-
-**Code Reference**: `src/gateway/call.ts`, `src/gateway/server-methods/`
-
-### 11.4 Agent Method Handler
-
-The `agent` method in the gateway:
-
-1. Validates parameters
-2. Resolves session and agent configuration
-3. Enqueues the command in the appropriate lane
-4. Tracks the run for `agent.wait` calls
-5. Returns run ID immediately (async)
-
-```typescript
-agentHandlers.agent = async ({ params, respond, context }) => {
-  // Validation...
-  const runId = randomUUID();
-  
-  // Enqueue the agent command
-  enqueueCommandInLane({
-    lane: params.lane || CommandLane.Main,
-    command: agentCommand,
-    params: { ...params, runId },
-  });
-  
-  // Return immediately
-  respond(true, { runId, status: "accepted" });
-};
-```
-
-**Code Reference**: `src/gateway/server-methods/agent.ts`
 
 ---
 
 ## 12. Complete Tool Reference ([Detailed Documentation](details/tool-reference.md))
 
-### 12.1 Session & Agent Tools
+### Session & Agent Tools
 
 | Tool | Purpose |
-| :--- | :--- |
-| `sessions_spawn` | Creates and delegates a task to a subagent |
-| `agents_list` | Lists available agent IDs that can be spawned |
-| `sessions_list` | Lists existing sessions (own or spawned) |
-| `sessions_history` | Reads the transcript of a session |
-| `sessions_send` | Sends a message to a running session (A2A communication) |
-| `session_status` | Gets current session status and metadata |
+|:-----|:--------|
+| `sessions_spawn` | Delegate task to subagent |
+| `sessions_list` | List existing sessions |
+| `sessions_history` | Read session transcript |
+| `session_status` | Get session metadata |
 
-### 12.2 File System Tools
+### File System Tools
 
 | Tool | Purpose |
-| :--- | :--- |
+|:-----|:--------|
 | `read` | Read file contents |
-| `write` | Write/create files |
+| `write` | Create/overwrite files |
 | `edit` | Edit existing files |
-| `apply_patch` | Apply unified diff patches |
-
-### 12.3 Runtime Tools
-
-| Tool | Purpose |
-| :--- | :--- |
 | `exec` | Execute shell commands |
-| `process` | Manage background processes |
-
-### 12.4 Web Tools
-
-| Tool | Purpose |
-| :--- | :--- |
-| `web_search` | Search the web |
-| `web_fetch` | Fetch URL content |
-| `browser` | Control browser automation |
-
-### 12.5 Memory Tools
-
-| Tool | Purpose |
-| :--- | :--- |
-| `memory_search` | Search agent memory |
-| `memory_get` | Retrieve memory entries |
-
-### 12.6 Communication Tools
-
-| Tool | Purpose |
-| :--- | :--- |
-| `message` | Send messages to external channels |
-| `gateway` | Gateway management |
-| `nodes` | Device/node management |
-
-### 12.7 Other Tools
-
-| Tool | Purpose |
-| :--- | :--- |
-| `cron` | Manage scheduled tasks |
-| `canvas` | Canvas/UI generation |
-| `image` | Image generation |
-| `tts` | Text-to-speech |
 
 ---
 
 ## 13. Summary
 
-### Architecture Flow Diagram
+### Architecture Flow
 
 ```
 User Message
@@ -799,16 +348,13 @@ User Message
 │  - Full tools   │
 │  - Full prompt  │
 └────────┬────────┘
-         │
          │ sessions_spawn(task, agentId)
          ▼
 ┌─────────────────┐
 │ SubagentRegistry│
 │ - Creates run   │
-│ - Generates key │
 │ - Monitors      │
 └────────┬────────┘
-         │
          │ callGateway("agent", lane: subagent)
          ▼
 ┌─────────────────────────────────────────────────────┐
@@ -823,23 +369,19 @@ User Message
                 │ - Minimal tools │
                 │ - Task prompt   │
                 └────────┬────────┘
-                         │
                          │ Completes task
                          ▼
                 ┌─────────────────┐
                 │  Agent Events   │
                 │ - lifecycle:end │
                 └────────┬────────┘
-                         │
                          │ Event listener triggered
                          ▼
                 ┌─────────────────┐
                 │ Announce Flow   │
                 │ - Read reply    │
                 │ - Build stats   │
-                │ - Format msg    │
                 └────────┬────────┘
-                         │
                          │ Based on queue mode
                          ▼
          ┌───────────────┴───────────────┐
@@ -855,22 +397,20 @@ User Message
 │                  Main Agent                         │
 │  - Receives subagent results                       │
 │  - Summarizes for user                              │
-│  - Continues conversation                           │
 └─────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Decisions
 
-1. **Recursion Prevention**: Subagents cannot spawn other subagents (enforced via session key detection)
+| Decision | Benefit |
+|:---------|:--------|
+| Recursion Prevention | Subagents cannot spawn subagents (no infinite loops) |
+| Lane Isolation | Subagents don't block user conversations |
+| Flexible Feedback | Multiple queue modes for context-aware delivery |
+| Persistence | Registry survives restarts |
+| Cost Tracking | Token usage and costs tracked per run |
+| Clean Prompts | Subagent prompts minimal and task-focused |
 
-2. **Lane Isolation**: Subagents run in dedicated lanes to avoid blocking user conversations
+---
 
-3. **Flexible Feedback**: Multiple queue modes allow context-aware result delivery
-
-4. **Persistence**: Registry survives restarts to ensure runs are tracked to completion
-
-5. **Cost Tracking**: Token usage and estimated costs are tracked per run for billing/reporting
-
-6. **Clean Prompts**: Subagent prompts are minimal and task-focused to maximize efficiency
-
-This architecture ensures that the main agent remains the "conductor," maintaining the relationship with the user, while specialized subagents handle heavy lifting in the background without polluting the main context window.
+**Summary**: The main agent remains the "conductor," maintaining the relationship with the user, while specialized subagents handle heavy lifting in the background without polluting the main context window.
