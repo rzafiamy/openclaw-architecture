@@ -22,7 +22,7 @@ This document outlines the complete architectural implementation of OpenClaw's h
 
 ---
 
-## 1. Core Principles
+## 1. Core Principles ([Detailed Documentation](details/core-principles.md))
 
 The OpenClaw A2A architecture is built on four pillars:
 
@@ -38,7 +38,7 @@ The OpenClaw A2A architecture is built on four pillars:
 
 ---
 
-## 2. Agent Configuration
+## 2. Agent Configuration ([Detailed Documentation](details/agent-configuration.md))
 
 ### 2.1 Agent Identity
 
@@ -92,7 +92,7 @@ When resolving which agent handles a request:
 
 ---
 
-## 3. Session Management
+## 3. Session Management ([Detailed Documentation](details/session-management.md))
 
 ### 3.1 Session Key Format
 
@@ -136,7 +136,7 @@ type SessionEntry = {
 
 ---
 
-## 4. The `sessions_spawn` Tool
+## 4. The `sessions_spawn` Tool ([Detailed Documentation](details/sessions-spawn-tool.md))
 
 The primary gateway for A2A interaction is the `sessions_spawn` tool. This tool allows an agent to create a background process to handle a specific task.
 
@@ -183,7 +183,7 @@ if (isSubagentSessionKey(requesterSessionKey)) {
 
 ---
 
-## 5. The Execution Lifecycle
+## 5. The Execution Lifecycle ([Detailed Documentation](details/execution-lifecycle.md))
 
 ### Step 1: Spawning
 
@@ -335,7 +335,7 @@ if (shouldSteer && isEmbeddedPiRunActive(sessionId)) {
 
 ---
 
-## 6. Event System
+## 6. Event System ([Detailed Documentation](details/event-system.md))
 
 ### 6.1 Agent Events
 
@@ -390,7 +390,7 @@ const unsubscribe = onAgentEvent((evt) => {
 
 ---
 
-## 7. Execution Lanes
+## 7. Execution Lanes ([Detailed Documentation](details/execution-lanes.md))
 
 Lanes provide isolation and prioritization for different types of agent runs:
 
@@ -433,7 +433,7 @@ The gateway routes the run to the appropriate lane, preventing subagent runs fro
 
 ---
 
-## 8. Queue Modes & Message Steering
+## 8. Queue Modes & Message Steering ([Detailed Documentation](details/queue-modes.md))
 
 ### 8.1 Queue Mode Types
 
@@ -490,7 +490,7 @@ enqueueAnnounce({
 
 ---
 
-## 9. Tool System
+## 9. Tool System ([Detailed Documentation](details/tool-system.md))
 
 ### 9.1 Tool Profiles
 
@@ -577,7 +577,7 @@ async function handleToolExecutionStart(ctx, evt) {
 
 ---
 
-## 10. System Prompt Construction
+## 10. System Prompt Construction ([Detailed Documentation](details/system-prompt.md))
 
 ### 10.1 Main Agent Prompt
 
@@ -649,7 +649,7 @@ When complete, your final response should include:
 
 ---
 
-## 11. Gateway RPC Layer
+## 11. Gateway RPC Layer ([Detailed Documentation](details/gateway-rpc.md))
 
 ### 11.1 Gateway Architecture
 
@@ -723,7 +723,7 @@ agentHandlers.agent = async ({ params, respond, context }) => {
 
 ---
 
-## 12. Complete Tool Reference
+## 12. Complete Tool Reference ([Detailed Documentation](details/tool-reference.md))
 
 ### 12.1 Session & Agent Tools
 
