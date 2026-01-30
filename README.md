@@ -34,6 +34,8 @@ The OpenClaw A2A architecture is built on four pillars:
 
 4. **Hierarchical Agent Identity**: Agents are identified by unique IDs (e.g., `main`, `researcher`, `coder`) and can be configured with different models, tool profiles, and capabilities.
 
+![Architecture](image.png)
+
 ---
 
 ## 2. Agent Configuration
